@@ -128,8 +128,13 @@ def _seed_sources(db: Session):
     db.commit()
 
 
-@app.on_event("startup")
-def startup():
+_initialized = False
+
+
+def _bootstrap() -> None:
+    global _initialized
+    if _initialized:
+        return
     Base.metadata.create_all(bind=engine)
     db = next(get_db())
     try:
@@ -137,6 +142,27 @@ def startup():
         _seed_sources(db)
     finally:
         db.close()
+    _initialized = True
+
+
+@app.on_event("startup")
+def startup():
+    try:
+        _bootstrap()
+    except Exception as exc:  # pragma: no cover - serverless cold start
+        print(f"[startup] deferred initialization: {exc}")
+
+
+@app.middleware("http")
+async def _serverless_bootstrap(request: Request, call_next):
+    # Serverless platforms do not always run lifespan events, so make sure the
+    # schema exists and the demo dataset is loaded before handling a request.
+    if not _initialized:
+        try:
+            _bootstrap()
+        except Exception as exc:  # pragma: no cover - DB not reachable yet
+            print(f"[bootstrap] deferred initialization: {exc}")
+    return await call_next(request)
 
 
 @app.get("/api/health")
@@ -528,15 +554,23 @@ def generate_report(body: ReportRequest, db: Session = Depends(get_db)):
         budgets=body.budgets_inr,
         weights=body.weights,
     )
+    request_payload = {
+        "title": body.title,
+        "emission_factor": body.emission_factor,
+        "budgets": body.budgets_inr,
+        "weights": body.weights,
+    }
+    summary = dict(result["summary"] or {})
+    summary["request"] = request_payload
     db.add(
         Report(
             title=result["title"],
             filename=result["filename"],
-            summary=result["summary"],
+            summary=summary,
         )
     )
     db.commit()
-    return {"status": "ok", "filename": result["filename"], "summary": result["summary"]}
+    return {"status": "ok", "filename": result["filename"], "summary": summary}
 
 
 @app.get("/api/reports")
@@ -565,7 +599,21 @@ def download_report(report_id: int, db: Session = Depends(get_db)):
 
     path = os.path.join(REPORTS_DIR, row.filename)
     if not os.path.exists(path):
-        raise HTTPException(404, "Report file missing on disk")
+        # Serverless filesystems are ephemeral: rebuild the PDF from the stored
+        # request parameters if the file from a previous instance is gone.
+        payload = (row.summary or {}).get("request")
+        if not payload:
+            raise HTTPException(404, "Report file missing on disk")
+        _ensure_default(db)
+        try:
+            rebuilt = report.build_report(db, **payload)
+        except Exception as exc:
+            raise HTTPException(500, f"Report could not be regenerated: {exc}")
+        row.filename = rebuilt["filename"]
+        db.commit()
+        path = rebuilt["path"]
+        if not os.path.exists(path):
+            raise HTTPException(404, "Report file missing on disk")
     return FileResponse(path, media_type="application/pdf", filename=row.filename)
 
 
